@@ -1,78 +1,76 @@
-import asyncio
-import websockets
+import os
 import json
-import pyaudio
+import websocket
+from dotenv import load_dotenv
 import base64
+import pyaudio
 
-# OpenAI API Configuration
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_WS_URL = "wss://api.openai.com/v1/realtime"
+# Load environment variables from .env file
+load_dotenv()
 
-# Audio Configuration
-CHUNK = 1024  # Audio buffer size
-FORMAT = pyaudio.paInt16
+# Get API Key from environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Ensure API Key is set
+if not OPENAI_API_KEY:
+    raise ValueError("❌ ERROR: OPENAI_API_KEY is not set. Check your .env file or environment variables.")
+
+# OpenAI's expected audio sample rate (reduce speed issue)
+SAMPLE_RATE = 24000  # OpenAI audio is usually 16 kHz
 CHANNELS = 1
-RATE = 48000  # Whisper API prefers 16kHz
+FORMAT = pyaudio.paInt16
 
-# Initialize PyAudio
-audio = pyaudio.PyAudio()
+# Initialize PyAudio for playback
+p = pyaudio.PyAudio()
+stream = p.open(format=FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,  # Ensure correct playback rate
+                output=True)
 
-def get_microphone_stream():
-    return audio.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,# Use your built-in mic
-        frames_per_buffer=CHUNK
-    )
 
-async def stream_audio():
-    """Streams microphone input to OpenAI's Realtime API"""
-    async with websockets.connect(
-        OPENAI_WS_URL,
-        extra_headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    ) as websocket:
-        print("🔗 Connected to OpenAI Realtime API")
+# OpenAI Realtime API WebSocket URL
+url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+headers = [
+    f"Authorization: Bearer {OPENAI_API_KEY}",
+    "OpenAI-Beta: realtime=v1"
+]
 
-        mic_stream = get_microphone_stream()
+def on_open(ws):
+    print("✅ Connected to OpenAI")
 
-        try:
-            while True:
-                audio_data = mic_stream.read(CHUNK)
-                encoded_audio = base64.b64encode(audio_data).decode("utf-8")
+    # Sending a simple instruction
+    event = {
+        "type": "response.create",
+        "response": {
+            "modalities": ["text", "audio"],
+            "instructions": "Please assist the user."
+        }
+    }
+    ws.send(json.dumps(event))
+    print("📤 Sent request to OpenAI")
 
-                await websocket.send(json.dumps({
-                    "type": "input_audio",
-                    "audio": encoded_audio
-                }))
+def on_message(ws, message):
+    data = json.loads(message)
+    print("📩 Received response:", json.dumps(data, indent=2))
 
-                response = await websocket.recv()
-                response_data = json.loads(response)
+    # Check if the response contains audio data
+    if data.get("type") == "response.audio.delta" and "delta" in data:
+        audio_data = data["delta"]  # Base64-encoded audio
 
-                if "text" in response_data:
-                    ai_response = response_data["text"]
-                    print(f"🗣️ AI: {ai_response}")
+        # Decode base64 audio data to raw PCM16 bytes
+        audio_bytes = base64.b64decode(audio_data)
 
-                    if ai_response.startswith("CMD:"):
-                        command = ai_response[4:].strip()
-                        execute_command(command)
+        # Play the audio bytes in real-time
+        stream.write(audio_bytes)
 
-        except KeyboardInterrupt:
-            print("\n🛑 Stopping CyberCore...")
-        finally:
-            mic_stream.stop_stream()
-            mic_stream.close()
-            audio.terminate()
+        print("🎵 Playing received audio...")
 
-async def execute_command(command):
-    """Execute CLI commands received from OpenAI"""
-    import subprocess
-    try:
-        print(f"⚡ Executing: {command}")
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        print(f"✅ Output:\n{result.stdout}")
-    except Exception as e:
-        print(f"❌ Error executing command: {str(e)}")
 
-if __name__ == "__main__":
-    asyncio.run(stream_audio())
+ws = websocket.WebSocketApp(
+    url,
+    header=headers,
+    on_open=on_open,
+    on_message=on_message,
+)
+
+ws.run_forever()
